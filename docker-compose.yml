@@ -1,0 +1,201 @@
+name: ${COMPOSE_PROJECT_NAME:-distributed-sync-lab}
+
+services:
+  mariadb:
+    image: mariadb:${MARIADB_VERSION:-11.4}
+    container_name: ${NODE_ID:-sync-node}-mariadb
+    restart: unless-stopped
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD:?MARIADB_ROOT_PASSWORD is required}
+      MARIADB_DATABASE: ${MARIADB_DATABASE:-sync_lab}
+      MARIADB_USER: ${MARIADB_USER:-sync_app}
+      MARIADB_PASSWORD: ${MARIADB_PASSWORD:?MARIADB_PASSWORD is required}
+    command:
+      - mariadbd
+      - --bind-address=0.0.0.0
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${MARIADB_BIND_IP:-0.0.0.0}:${MARIADB_PORT:-3306}:3306"
+    volumes:
+      - mariadb-data:/var/lib/mysql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mariadb-admin ping -h 127.0.0.1 -uroot -p$${MARIADB_ROOT_PASSWORD} --silent",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    networks:
+      - cluster
+
+  redis:
+    image: redis:${REDIS_VERSION:-7.4-alpine}
+    container_name: ${NODE_ID:-sync-node}-redis
+    restart: unless-stopped
+    environment:
+      REDIS_ROLE: ${REDIS_ROLE:-primary}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_PRIMARY_HOST: ${REDIS_PRIMARY_HOST:-redis}
+      REDIS_PRIMARY_PORT: ${REDIS_PRIMARY_PORT:-6379}
+      ADVERTISE_IP: ${ADVERTISE_IP:?ADVERTISE_IP is required}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+    command: >
+      sh -ec '
+        if [ "$${REDIS_ROLE}" = "replica" ]; then
+          exec redis-server
+            --bind 0.0.0.0
+            --protected-mode no
+            --port 6379
+            --appendonly yes
+            --appendfsync everysec
+            --requirepass "$${REDIS_PASSWORD}"
+            --masterauth "$${REDIS_PASSWORD}"
+            --replicaof "$${REDIS_PRIMARY_HOST}" "$${REDIS_PRIMARY_PORT}"
+            --replica-announce-ip "$${ADVERTISE_IP}"
+            --replica-announce-port "$${REDIS_PORT}";
+        fi;
+
+        exec redis-server
+          --bind 0.0.0.0
+          --protected-mode no
+          --port 6379
+          --appendonly yes
+          --appendfsync everysec
+          --requirepass "$${REDIS_PASSWORD}";
+      '
+    ports:
+      - "${REDIS_BIND_IP:-0.0.0.0}:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - cluster
+
+  redis-sentinel:
+    image: redis:${REDIS_VERSION:-7.4-alpine}
+    container_name: ${NODE_ID:-sync-node}-redis-sentinel
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_PRIMARY_NAME: ${REDIS_PRIMARY_NAME:-sync-master}
+      REDIS_PRIMARY_HOST: ${REDIS_PRIMARY_HOST:?REDIS_PRIMARY_HOST is required}
+      REDIS_PRIMARY_PORT: ${REDIS_PRIMARY_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      SENTINEL_PASSWORD: ${SENTINEL_PASSWORD:?SENTINEL_PASSWORD is required}
+      SENTINEL_PORT: ${SENTINEL_PORT:-26379}
+      SENTINEL_QUORUM: ${SENTINEL_QUORUM:-2}
+      SENTINEL_DOWN_AFTER_MS: ${SENTINEL_DOWN_AFTER_MS:-5000}
+      SENTINEL_FAILOVER_TIMEOUT_MS: ${SENTINEL_FAILOVER_TIMEOUT_MS:-15000}
+      ADVERTISE_IP: ${ADVERTISE_IP:?ADVERTISE_IP is required}
+    command: >
+      sh -ec '
+        cat > /tmp/sentinel.conf <<EOF
+      port 26379
+      bind 0.0.0.0
+      protected-mode no
+      dir /data
+      requirepass $${SENTINEL_PASSWORD}
+      sentinel monitor $${REDIS_PRIMARY_NAME} $${REDIS_PRIMARY_HOST} $${REDIS_PRIMARY_PORT} $${SENTINEL_QUORUM}
+      sentinel auth-pass $${REDIS_PRIMARY_NAME} $${REDIS_PASSWORD}
+      sentinel down-after-milliseconds $${REDIS_PRIMARY_NAME} $${SENTINEL_DOWN_AFTER_MS}
+      sentinel failover-timeout $${REDIS_PRIMARY_NAME} $${SENTINEL_FAILOVER_TIMEOUT_MS}
+      sentinel parallel-syncs $${REDIS_PRIMARY_NAME} 1
+      sentinel announce-ip $${ADVERTISE_IP}
+      sentinel announce-port $${SENTINEL_PORT}
+      EOF
+        exec redis-sentinel /tmp/sentinel.conf;
+      '
+    ports:
+      - "${SENTINEL_BIND_IP:-0.0.0.0}:${SENTINEL_PORT:-26379}:26379"
+    volumes:
+      - sentinel-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -p 26379 -a \"$${SENTINEL_PASSWORD}\" ping | grep -q PONG",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - cluster
+
+  witness-sentinel:
+    image: redis:${REDIS_VERSION:-7.4-alpine}
+    container_name: ${NODE_ID:-sync-node}-witness-sentinel
+    restart: unless-stopped
+    profiles:
+      - witness
+    environment:
+      REDIS_PRIMARY_NAME: ${REDIS_PRIMARY_NAME:-sync-master}
+      REDIS_PRIMARY_HOST: ${REDIS_PRIMARY_HOST:?REDIS_PRIMARY_HOST is required}
+      REDIS_PRIMARY_PORT: ${REDIS_PRIMARY_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      SENTINEL_PASSWORD: ${SENTINEL_PASSWORD:?SENTINEL_PASSWORD is required}
+      WITNESS_SENTINEL_PORT: ${WITNESS_SENTINEL_PORT:-26380}
+      SENTINEL_QUORUM: ${SENTINEL_QUORUM:-2}
+      SENTINEL_DOWN_AFTER_MS: ${SENTINEL_DOWN_AFTER_MS:-5000}
+      SENTINEL_FAILOVER_TIMEOUT_MS: ${SENTINEL_FAILOVER_TIMEOUT_MS:-15000}
+      ADVERTISE_IP: ${ADVERTISE_IP:?ADVERTISE_IP is required}
+    command: >
+      sh -ec '
+        cat > /tmp/sentinel.conf <<EOF
+      port 26379
+      bind 0.0.0.0
+      protected-mode no
+      dir /data
+      requirepass $${SENTINEL_PASSWORD}
+      sentinel monitor $${REDIS_PRIMARY_NAME} $${REDIS_PRIMARY_HOST} $${REDIS_PRIMARY_PORT} $${SENTINEL_QUORUM}
+      sentinel auth-pass $${REDIS_PRIMARY_NAME} $${REDIS_PASSWORD}
+      sentinel down-after-milliseconds $${REDIS_PRIMARY_NAME} $${SENTINEL_DOWN_AFTER_MS}
+      sentinel failover-timeout $${REDIS_PRIMARY_NAME} $${SENTINEL_FAILOVER_TIMEOUT_MS}
+      sentinel parallel-syncs $${REDIS_PRIMARY_NAME} 1
+      sentinel announce-ip $${ADVERTISE_IP}
+      sentinel announce-port $${WITNESS_SENTINEL_PORT}
+      EOF
+        exec redis-sentinel /tmp/sentinel.conf;
+      '
+    ports:
+      - "${SENTINEL_BIND_IP:-0.0.0.0}:${WITNESS_SENTINEL_PORT:-26380}:26379"
+    volumes:
+      - witness-sentinel-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "redis-cli -p 26379 -a \"$${SENTINEL_PASSWORD}\" ping | grep -q PONG",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - cluster
+
+networks:
+  cluster:
+    driver: bridge
+
+volumes:
+  mariadb-data:
+    name: ${NODE_ID:-sync-node}-mariadb-data
+  redis-data:
+    name: ${NODE_ID:-sync-node}-redis-data
+  sentinel-data:
+    name: ${NODE_ID:-sync-node}-sentinel-data
+  witness-sentinel-data:
+    name: ${NODE_ID:-sync-node}-witness-sentinel-data
+
